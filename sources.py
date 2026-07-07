@@ -7,6 +7,7 @@ Every connector returns a pandas DataFrame with the unified schema:
 
 from __future__ import annotations
 
+import html as html_lib
 import re
 from datetime import datetime, timezone
 
@@ -249,5 +250,139 @@ def _reddit_pullpush(query: str, limit: int, sub: str) -> pd.DataFrame:
             "text": text[:3000],
             "author": d.get("author", ""),
             "url": "https://www.reddit.com" + (d.get("permalink") or ""),
+        })
+    return pd.DataFrame(rows, columns=COLUMNS) if rows else _empty()
+
+
+# ---------------------------------------------------------------- Hacker News
+
+def fetch_hackernews(query: str, limit: int = 100) -> pd.DataFrame:
+    """Search Hacker News stories and comments via the free Algolia API."""
+    resp = requests.get(
+        "https://hn.algolia.com/api/v1/search_by_date",
+        params={"query": query, "tags": "(story,comment)", "hitsPerPage": min(limit, 100)},
+        headers={"User-Agent": USER_AGENT}, timeout=20,
+    )
+    resp.raise_for_status()
+    hits = resp.json().get("hits", [])
+
+    rows = []
+    for h in hits:
+        title = h.get("title") or ""
+        body = h.get("story_text") or h.get("comment_text") or ""
+        body = re.sub(r"<[^>]+>", " ", body)
+        text = html_lib.unescape(f"{title}. {body}").strip(". ")
+        text = re.sub(r"\s+", " ", text)
+        if len(text.strip()) <= 2:
+            continue
+        rows.append({
+            "source": "Hacker News",
+            "date": pd.to_datetime(h.get("created_at"), utc=True, errors="coerce"),
+            "rating": None,
+            "text": text[:3000],
+            "author": h.get("author", ""),
+            "url": f"https://news.ycombinator.com/item?id={h.get('objectID')}",
+        })
+    return pd.DataFrame(rows, columns=COLUMNS) if rows else _empty()
+
+
+# ---------------------------------------------------------------- Google News
+
+def fetch_google_news(query: str, limit: int = 50) -> pd.DataFrame:
+    """Press and media mentions via the free Google News RSS feed."""
+    import xml.etree.ElementTree as ET
+
+    resp = requests.get(
+        "https://news.google.com/rss/search",
+        params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+        headers={"User-Agent": _BROWSER_UA}, timeout=20,
+    )
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+
+    rows = []
+    for item in root.findall(".//item")[:limit]:
+        title = html_lib.unescape(item.findtext("title", "") or "")
+        outlet = item.findtext("source", "") or ""
+        if len(title.strip()) <= 2:
+            continue
+        rows.append({
+            "source": "Google News",
+            "date": pd.to_datetime(item.findtext("pubDate", None), utc=True, errors="coerce"),
+            "rating": None,
+            "text": title[:3000],
+            "author": outlet,
+            "url": item.findtext("link", "") or "",
+        })
+    return pd.DataFrame(rows, columns=COLUMNS) if rows else _empty()
+
+
+# -------------------------------------------------------------------- Bluesky
+
+def fetch_bluesky(query: str, limit: int = 100) -> pd.DataFrame:
+    """Search public Bluesky posts via the free public AppView API."""
+    posts = []
+    for host in ("https://api.bsky.app", "https://public.api.bsky.app"):
+        try:
+            resp = requests.get(
+                f"{host}/xrpc/app.bsky.feed.searchPosts",
+                params={"q": query, "limit": min(limit, 100), "sort": "latest"},
+                headers={"User-Agent": _BROWSER_UA}, timeout=20,
+            )
+            resp.raise_for_status()
+            posts = resp.json().get("posts", [])
+            if posts:
+                break
+        except Exception:
+            continue
+
+    rows = []
+    for p in posts:
+        record = p.get("record", {})
+        text = re.sub(r"\s+", " ", record.get("text") or "").strip()
+        if len(text) <= 2:
+            continue
+        handle = p.get("author", {}).get("handle", "")
+        rkey = (p.get("uri") or "").rsplit("/", 1)[-1]
+        rows.append({
+            "source": "Bluesky",
+            "date": pd.to_datetime(record.get("createdAt") or p.get("indexedAt"),
+                                   utc=True, errors="coerce"),
+            "rating": None,
+            "text": text[:3000],
+            "author": handle,
+            "url": f"https://bsky.app/profile/{handle}/post/{rkey}" if handle and rkey else "",
+        })
+    return pd.DataFrame(rows, columns=COLUMNS) if rows else _empty()
+
+
+# --------------------------------------------------------------- Stack Overflow
+
+def fetch_stackoverflow(query: str, limit: int = 50) -> pd.DataFrame:
+    """Search Stack Overflow questions via the free Stack Exchange API."""
+    resp = requests.get(
+        "https://api.stackexchange.com/2.3/search/advanced",
+        params={"order": "desc", "sort": "creation", "q": query,
+                "site": "stackoverflow", "pagesize": min(limit, 100), "filter": "withbody"},
+        headers={"User-Agent": USER_AGENT}, timeout=25,
+    )
+    resp.raise_for_status()
+    items = resp.json().get("items", [])
+
+    rows = []
+    for it in items:
+        title = html_lib.unescape(it.get("title") or "")
+        body = re.sub(r"<[^>]+>", " ", it.get("body") or "")
+        text = html_lib.unescape(f"{title}. {body}").strip(". ")
+        text = re.sub(r"\s+", " ", text)
+        if len(text.strip()) <= 2:
+            continue
+        rows.append({
+            "source": "Stack Overflow",
+            "date": datetime.fromtimestamp(it.get("creation_date", 0), tz=timezone.utc),
+            "rating": None,
+            "text": text[:3000],
+            "author": it.get("owner", {}).get("display_name", ""),
+            "url": it.get("link", ""),
         })
     return pd.DataFrame(rows, columns=COLUMNS) if rows else _empty()
